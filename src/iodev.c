@@ -10,6 +10,7 @@
 #include <sys/errno.h>
 
 #include "iodev.h"
+#include "stringstore.h"
 
 #define IODEV_ALLOC 0x25a1da5
 
@@ -23,6 +24,7 @@ int iodev_is_listener(iodev_t *dev) { return dev->listener; }
 int iodev_is_open(iodev_t *dev) { return iodev_getstate(dev) >= IODEV_OPEN; }
 buffer_t *iodev_tbuf(iodev_t *dev) { return &dev->tbuf; }
 buffer_t *iodev_rbuf(iodev_t *dev) { return &dev->rbuf; }
+stringstore_t *iodev_stringstore(iodev_t *dev) { return dev->linebuf; }
 
 selector_t *getselector(iodev_t *dev) { return dev->selector; }
 void setselector(iodev_t *dev, selector_t *selector) { dev->selector = selector; }
@@ -96,8 +98,10 @@ iodev_alloc_cfg(size_t size, const char *name, void (*free_cfg)(iodev_cfg_t *)) 
 
 void
 iodev_free_cfg(iodev_cfg_t *cfg) {
-    cfg->free_cfg(cfg);
-    free(cfg);
+    if (cfg != NULL) {
+        cfg->free_cfg(cfg);
+        free(cfg);
+    }
 }
 
 
@@ -142,13 +146,13 @@ iodev_set_masks(iodev_t *dev, fd_set *r, fd_set *w, fd_set *x) {
             break;
         case IODEV_CLOSING:     // pre-close flushing
             if (buffer_used(iodev_tbuf(dev)) > 0) {
-                FD_SET(dev->fd, w);
-                FD_SET(dev->fd, x);
+                if (dev->sendOk(dev)) {
+                    FD_SET(dev->fd, w);
+                    FD_SET(dev->fd, x);
+                }
                 is_active++;
-            } else {
-                FD_SET(dev->fd, x);
+            } else
                 dev->close(dev, IOFLAG_NONE);
-            }
             break;
         case IODEV_NONE:        // default (startup) state
         case IODEV_CLOSED:      // currently closed, due for reopen
@@ -156,7 +160,6 @@ iodev_set_masks(iodev_t *dev, fd_set *r, fd_set *w, fd_set *x) {
             break;
         case IODEV_PENDING:     // waiting for open to complete
             FD_SET(dev->fd, r);
-            FD_SET(dev->fd, x);
             is_active++;
             break;
         case IODEV_OPEN:        // open/operating
@@ -184,7 +187,7 @@ iodev_read_handler(iodev_t *dev) {
     else {
         size_t available = buffer_available(&dev->rbuf);
         void *tmp = alloca(available);
-        rc = read(dev->fd, tmp, available);
+        rc = iodev_read(dev, tmp, available);
         if (rc > 0)
             buffer_put(&dev->rbuf, tmp, (size_t)rc);
         else {
@@ -194,7 +197,7 @@ iodev_read_handler(iodev_t *dev) {
                 iodev_notify("iodev %s EOF from fd %d, closing", cfg->name, dev->fd);
             buffer_flush(&dev->rbuf);
             buffer_flush(&dev->tbuf);
-            iodev_setstate(dev, IODEV_CLOSING);
+            dev->close(dev, IODEV_CLOSED);
         }
     }
     return rc;
@@ -220,7 +223,7 @@ iodev_write_handler(iodev_t *dev) {
                 iodev_error("iodev %s write error(%d): %s", cfg->name, errno, strerror(errno));
                 buffer_flush(&dev->rbuf);
                 buffer_flush(&dev->tbuf);
-                iodev_setstate(dev, IODEV_CLOSING);
+                dev->close(dev, IODEV_NONE);
             } else { // advance the counter by amount written
                 buffer_get(&dev->tbuf, NULL, (size_t)rc);
             }
@@ -232,18 +235,35 @@ iodev_write_handler(iodev_t *dev) {
 
 static ssize_t
 iodev_except_handler(iodev_t *dev) {
-    return not_implemented(dev, "except_handler");
+    int fd = dev->fd, err = errno;
+    dev->close(dev, IODEV_NONE);
+    return iodev_error("exception fd %d, device = %s error(%d): %s", fd, iodev_driver(dev), err, strerror(err));
 }
 
 
 ssize_t
 iodev_read(iodev_t *dev, void *buf, size_t len) {
-    return not_implemented(dev, "read");
+    if (dev == NULL || !iodev_is_open(dev)) {
+        iodev_error("iodev.read() called with invalid or closed device");
+        return -1;
+    }
+    return read(dev->fd, buf, len);
 }
 
 ssize_t
 iodev_write(iodev_t *dev, void const *buf, size_t len) {
-    return not_implemented(dev, "write");
+    if (dev == NULL || !iodev_is_open(dev)) {
+        iodev_error("iodev.write() called with invalid or closed device");
+        return -1;
+    }
+    if (buf != NULL && len > 0)
+        buffer_put(&dev->tbuf, buf, len);
+    return len;
+}
+
+static int
+iodev_sendok(iodev_t *dev) {
+    return 1;
 }
 
 
@@ -273,18 +293,22 @@ iodev_init(iodev_t *dev, iodev_cfg_t *cfg, size_t bufsize) {
     dev->except_handler = iodev_except_handler;
     dev->read = iodev_read;
     dev->write = iodev_write;
+    dev->sendOk = iodev_sendok;
     return dev;
 }
 
 
 void
 iodev_free(iodev_t *dev) {
-    buffer_free(&dev->rbuf);
-    buffer_free(&dev->tbuf);
-    iodev_free_cfg(dev->cfg);
-    if (dev->alloc == IODEV_ALLOC) {
-        dev->alloc = 0;
-        free(dev);
+    if (dev != NULL) {
+        buffer_free(&dev->rbuf);
+        buffer_free(&dev->tbuf);
+        iodev_free_cfg(dev->cfg);
+        stringstore_free(dev->linebuf);
+        if (dev->alloc == IODEV_ALLOC) {
+            dev->alloc = 0;
+            free(dev);
+        }
     }
 }
 

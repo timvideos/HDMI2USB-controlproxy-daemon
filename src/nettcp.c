@@ -15,6 +15,7 @@
 #include "nettcp.h"
 #include "netutils.h"
 #include "selector.h"
+#include "stringstore.h"
 
 
 tcp_cfg_t *
@@ -25,9 +26,11 @@ tcp_getcfg(iodev_t *sdev) {
 
 void
 tcp_free_cfg(iodev_cfg_t *cfg) {
-    tcp_cfg_t *tcpcfg = (tcp_cfg_t *)cfg;
-    free(tcpcfg->local);
-    free(tcpcfg->remote);
+    if (cfg != NULL) {
+        tcp_cfg_t *tcpcfg = (tcp_cfg_t *)cfg;
+        free(tcpcfg->local);
+        free(tcpcfg->remote);
+    }
 }
 
 
@@ -101,7 +104,7 @@ tcp_open_listen(iodev_t *dev) {
         }
 
         // finally bind it and listen
-        if (bind(dev->fd, cfg->local, cfg->local->sa_len) == -1) {
+        if (bind(dev->fd, cfg->local, cfg->addrlen) == -1) {
             iodev_error("socket bind error(%d): %s", errno, strerror(errno));
             dev->close(dev, IOFLAG_INACTIVE);
         } else if (listen(dev->fd, BACKLOG_SIZE) < 0) {
@@ -200,21 +203,23 @@ tcp_close_accept(iodev_t *dev, int flags) {
 
 
 static int
-tcp_configure(iodev_t *dev, void * data) {
+tcp_configure(iodev_t *dev, void *data) {
     return 0;
 }
 
-
 static iodev_t *
-tcp_create(iodev_t *dev, struct sockaddr *local, struct sockaddr *remote, size_t bufsize) {
+tcp_create(iodev_t *dev, struct sockaddr *local, struct sockaddr *remote, size_t bufsize, int with_linebuf) {
     // First create the basic (slightly larger) config
     iodev_cfg_t *cfg = iodev_alloc_cfg(sizeof(tcp_cfg_t), "tcp", tcp_free_cfg);
     iodev_t *tcp = iodev_init(dev, cfg, bufsize);
 
     // Initialise the extras
     tcp_cfg_t *tcfg = tcp_getcfg(tcp);
+    tcfg->addrlen = local != NULL ? sockaddr_len(local) : remote != NULL ? sockaddr_len(remote) : 0;
     tcfg->local = sockaddr_dup(local);
     tcfg->remote = sockaddr_dup(remote);
+    if (with_linebuf)
+        dev->linebuf = stringstore_init(NULL);
 
     // default functions
     tcp->open = tcp_open;
@@ -227,7 +232,7 @@ tcp_create(iodev_t *dev, struct sockaddr *local, struct sockaddr *remote, size_t
 
 iodev_t *
 tcp_create_listen(iodev_t *dev, struct sockaddr *local, size_t bufsize) {
-    iodev_t *tcp = tcp_create(dev, local, NULL, 0);
+    iodev_t *tcp = tcp_create(dev, local, NULL, 0, 0);
 
     // we don't use bufsize for this socket since there is no IO
     // but use it for devices created via accept(), so record it here
@@ -244,7 +249,7 @@ tcp_create_listen(iodev_t *dev, struct sockaddr *local, size_t bufsize) {
 
 iodev_t *
 tcp_create_connect(iodev_t *dev, struct sockaddr *remote, size_t bufsize) {
-    iodev_t *tcp = tcp_create(dev, NULL, remote, bufsize);
+    iodev_t *tcp = tcp_create(dev, NULL, remote, bufsize, 1);
 
     // tcp->close = tcp_close_connect;
 
@@ -254,7 +259,7 @@ tcp_create_connect(iodev_t *dev, struct sockaddr *remote, size_t bufsize) {
 
 iodev_t *
 tcp_create_accepted(iodev_t *dev, int fd, struct sockaddr *remote, size_t bufsize) {
-    iodev_t *tcp = tcp_create(dev, NULL, remote, bufsize);
+    iodev_t *tcp = tcp_create(dev, NULL, remote, bufsize, 1);
     tcp_accept(tcp, fd, remote);
     tcp->close = tcp_close_accept;
     return tcp;

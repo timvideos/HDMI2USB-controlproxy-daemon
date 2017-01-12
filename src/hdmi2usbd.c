@@ -19,17 +19,24 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/errno.h>
+#include <signal.h>
+#include <sys/time.h>
 
 #ifdef __APPLE__
 #undef daemon
 extern int daemon(int, int);
+#else
+#include <unistd.h>
 #endif
+
+#define COMMAND_PACE 500000       // 500ms == 500000us
 
 
 #include "hdmi2usbd.h"
 #include "logging.h"
 #include "device.h"
 #include "netutils.h"
+#include "stringstore.h"
 
 
 //// Logging interface ////
@@ -66,12 +73,12 @@ static int sigvec_index = 0;
 static struct {
     int sig;
     void (*handler)(int);
-} sigstack[MAX_SIGVEC];
+} signal_stack[MAX_SIGVEC];
 
 static int
 push_sighandler(int sig, void (*new_handler)(int)) {
-    sigstack[sigvec_index].sig = sig;
-    sigstack[sigvec_index].handler = signal(sig, new_handler);
+    signal_stack[sigvec_index].sig = sig;
+    signal_stack[sigvec_index].handler = signal(sig, new_handler);
     return sigvec_index < MAX_SIGVEC ? ++sigvec_index : sigvec_index;
 }
 
@@ -79,7 +86,7 @@ static int
 pop_sighandler() {
     if (sigvec_index) {
         --sigvec_index;
-        signal(sigstack[sigvec_index].sig, sigstack[sigvec_index].handler);
+        signal(signal_stack[sigvec_index].sig, signal_stack[sigvec_index].handler);
     }
     return sigvec_index;
 }
@@ -119,7 +126,7 @@ hdmi2usb_init(struct hdmi2usb *app, int rc) {
             struct sockaddr *addr = ipaddriter_next(&iter);
             switch (addr->sa_family) {
                 case AF_INET: {
-                    struct sockaddr_in *s4 = (struct sockaddr_in *) addr;
+                    struct sockaddr_in *s4 = (void *) addr;
                     if (s4->sin_addr.s_addr == INADDR_ANY) {
                         listen_ports |= 4;
                     } else if ((listen_ports & 1) == 0) {  // create ipv4 listen socket
@@ -131,7 +138,7 @@ hdmi2usb_init(struct hdmi2usb *app, int rc) {
                     break;
                 }
                 case AF_INET6: {
-                    struct sockaddr_in6 *s6 = (struct sockaddr_in6 *) addr;
+                    struct sockaddr_in6 *s6 = (void *) addr;
                     struct in6_addr in6addr = IN6ADDR_ANY_INIT;
                     if (IN6_ARE_ADDR_EQUAL(&s6->sin6_addr, &in6addr)) {
                         listen_ports |= 4;
@@ -178,13 +185,66 @@ hdmi2usb_process_serial_data(struct hdmi2usb *app, iodev_t *serial) {
     size_t s_bytes = iodev_is_open(serial) ? buffer_used(iodev_rbuf(serial)) : 0;
     if (s_bytes) {
         // process the datas here
-        //... TODO
-        // pick up anything left over and copy to network connections (if any)
+        //... TODO (maybe?)
+        // pick up anything left over and queue for output to network connections
         s_bytes = buffer_move(&app->copy, iodev_rbuf(serial), s_bytes);
     }
     return s_bytes;
 }
 
+//
+// hdmi2usb_process_client_data()
+// read pending input from network connections and buffer this
+// for later processing in hdmi2usb_process_client_commands()
+// we don't send this directly/immediately because there are
+// limitations on the number of commands we can process at once
+// and the rate at which they can be processed.
+
+static void
+hdmi2usb_process_client_data(struct hdmi2usb *app, iodev_t *dev) {
+    buffer_t *rbuf = iodev_rbuf(dev);
+    size_t r_bytes = buffer_used(rbuf);
+    if (r_bytes) {
+        stringstore_t *linebuf = iodev_stringstore(dev);
+        if (linebuf) {
+            void *data = alloca(r_bytes);
+            r_bytes = buffer_get(rbuf, data, r_bytes);
+            stringstore_append(linebuf, data, r_bytes);
+        }
+    }
+}
+
+//
+// hdmi2usb_process_client_commands()
+// read lines of text from the connection's input buffer and
+// send these to the hdmi2usb device
+// commands send across all connections need to be rate limited as
+// some of these will result in the device not accepting input for
+// a short period when the command is executed.
+
+static void
+hdmi2usb_process_client_commands(struct hdmi2usb *app, iodev_t *serial, iodev_t *dev) {
+    // Skip even checking unless it is time to send another command
+    if (timer_expired(&app->last_command)) {
+        // check we are have commands to send to this device
+        stringstore_t *linebuf = dev->linebuf;
+        if (linebuf != NULL && stringstore_length(linebuf) > 0) {
+            stringstore_iterator_t iter = stringstore_iterator(linebuf);
+            size_t length =0;
+            // Get the next command (if there is one)
+            char const *command = stringstore_nextstr(&iter, &length);
+            if (command != NULL && length > 0) {
+                // There is one: send it to the serial device
+                iodev_write(serial, command, length);
+                // Remove the command from the line buffer, and reset time last command was sent
+                stringstore_consume(linebuf, length);
+                // Need more accurate time here, don't want the latency of the processing loop omitted
+                timer_reset(&app->last_command, COMMAND_PACE);
+            }
+        }
+
+    }
+}
 
 // Process cycle for the application
 
@@ -192,12 +252,13 @@ static int
 hdmi2usb_process(struct hdmi2usb *app, int rc) {
     // basic stuff
     // The serial device is alaways at index 0 in the managed devices array.
-    // It must be open and active, else everything else is pointless
+    // It must be open and active, if not everything else is pointless
     iodev_t *serial = selector_get_device(&app->selector, 0);
     if (serial == NULL || iodev_getstate(serial) == IODEV_INACTIVE)
         return EX_NORMAL;
+
     // At least one listen port must also be open, check for this
-    // when we scan ports for application I/O
+    // when we iterate ports for application I/O processing
     size_t s_bytes = hdmi2usb_process_serial_data(app, serial);
     int listener_count = 0;
     int connect_count = 0;
@@ -211,11 +272,14 @@ hdmi2usb_process(struct hdmi2usb *app, int rc) {
             if (s_bytes)
                 buffer_copy(iodev_tbuf(dev), &app->copy, s_bytes);
             // process input from network connection
-            //... TODO
+            hdmi2usb_process_client_data(app, dev);
+            // send any pending input on this connection to the device (maybe)
+            hdmi2usb_process_client_commands(app, serial, dev);
         }
     }
     // reset the copy buffer
     buffer_flush(&app->copy);
+    // exit if there are no active listeners
     return !listener_count ? EX_NORMAL : rc;
 }
 
@@ -235,6 +299,8 @@ hdmi2usb_main(struct hdmi2usb *app) {
                 rc = hdmi2usb_init(app, hdmi2usb_close(app, EX_SUCCESS));
                 break;
             case SIGINT:
+            case SIGQUIT:
+            case SIGTERM:
                 log_critical("Keyboard Quit");
                 rc = EX_REQUEST;
                 break;

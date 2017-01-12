@@ -20,8 +20,10 @@ set(SUPPORT_SOURCE_FILES
         src/buffer.c include/buffer.h
         src/logging.c include/logging.h
         src/netutils.c include/netutils.h
+        src/stringstore.c include/stringstore.h
         src/iodev.c include/iodev.h
         src/selector.c include/selector.h
+        src/timer.c include/timer.h
         src/serial.c include/serial.h
         src/nettcp.c include/nettcp.h
         src/device.c include/device.h)
@@ -58,7 +60,8 @@ if (tests)
             tests/test_array.cc
             tests/test_buffer.cc
             tests/test_ipaddrs.cc
-            tests/test_find_serial.cc)
+            tests/test_find_serial.cc
+            tests/test_stringstore.cc )
 
     target_link_libraries(runUnitTests gtest gtest_main)
     add_test(unit_tests runUnitTests)
